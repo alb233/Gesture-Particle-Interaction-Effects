@@ -32,8 +32,8 @@ let audioElement = null;
 let currentMusic = null;
 // 存储自定义图像数据
 let customImageData = null;
-// 粒子历史位置（用于拖尾效果）
-let particleHistory = [];
+// 模拟手势定时器句柄（防止重复注册导致叠加）
+let simulationIntervalId = null;
 
 // 初始化Three.js场景
 function initThreeJS() {
@@ -48,7 +48,7 @@ function initThreeJS() {
     // 创建渲染器
     renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 上限 2x，避免高分屏填充率成倍上涨
     document.getElementById('canvas-container').appendChild(renderer.domElement);
     
     // 添加光源
@@ -67,6 +67,11 @@ function initThreeJS() {
     
     // 窗口大小调整事件
     window.addEventListener('resize', onWindowResize);
+}
+
+// 点大小的基准系数，等价于 PointsMaterial 的 sizeAttenuation 内部 scale
+function getPointScale() {
+    return window.innerHeight * 0.5 * Math.min(window.devicePixelRatio, 2);
 }
 
 // 创建粒子系统
@@ -92,91 +97,68 @@ function createParticleSystem() {
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     
-    // 创建粒子材质
-    const material = new THREE.PointsMaterial({
-        size: particleSize,
-        vertexColors: true,
+    // 创建粒子材质（自定义 shader：缩放与逐粒子错峰全部在 GPU 完成，
+    // 每帧 CPU 只更新几个 uniform，不再遍历上万个粒子、也不再上传整个位置缓冲）
+    const material = new THREE.ShaderMaterial({
+        uniforms: {
+            uTargetScale: { value: targetScale },
+            uFromScale: { value: targetScale },
+            uProgress: { value: 1.0 },   // 0→1 表示本轮缩放过渡进度
+            uSize: { value: particleSize },
+            uPointScale: { value: getPointScale() }
+        },
+        vertexShader: `
+            attribute float aPhase;
+            uniform float uTargetScale;
+            uniform float uFromScale;
+            uniform float uProgress;
+            uniform float uSize;
+            uniform float uPointScale;
+            varying vec3 vColor;
+
+            void main() {
+                // 每颗粒子按 aPhase 错峰启动，复刻原来"逐粒子惯性缓动"的观感
+                float delay = aPhase * 0.35;
+                float p = clamp((uProgress - delay) / 0.65, 0.0, 1.0);
+                p = p * p * (3.0 - 2.0 * p);
+                float s = mix(uFromScale, uTargetScale, p);
+
+                vec4 mvPosition = modelViewMatrix * vec4(position * s, 1.0);
+                gl_PointSize = uSize * (uPointScale / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+
+                vColor = color;
+            }
+        `,
+        fragmentShader: `
+            varying vec3 vColor;
+
+            void main() {
+                // 程序化圆形光斑，替代原来的 64x64 径向渐变纹理
+                float d = length(gl_PointCoord - vec2(0.5));
+                float a = smoothstep(0.5, 0.05, d);
+                if (a < 0.01) discard;
+                gl_FragColor = vec4(vColor, a * 0.8);
+            }
+        `,
         transparent: true,
-        opacity: 0.8,
-        sizeAttenuation: true,
-        alphaTest: 0.5, // 启用alpha测试，使边缘更平滑
-        blending: THREE.AdditiveBlending, // 使用加法混合，使粒子更明亮
-        // 使用圆形纹理（可选）
-        map: generateCircleTexture()
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexColors: true
     });
     
-    // 保存每个粒子的基础位置和缩放属性
-    const basePositions = new Float32Array(particleCount * 3);
-    const particleScales = new Float32Array(particleCount);
-    const particleVelocities = new Float32Array(particleCount);
-    const particleInertias = new Float32Array(particleCount);
-    
-    // 初始化粒子的基础位置和缩放属性
+    // 每颗粒子的错峰系数，供 shader 做逐粒子延迟
+    const phases = new Float32Array(particleCount);
     for (let i = 0; i < particleCount; i++) {
-        // 保存基础位置
-        basePositions[i * 3] = positions[i * 3];
-        basePositions[i * 3 + 1] = positions[i * 3 + 1];
-        basePositions[i * 3 + 2] = positions[i * 3 + 2];
-        
-        // 初始缩放为1
-        particleScales[i] = 1.0;
-        
-        // 随机速度：0.01到0.08之间
-        particleVelocities[i] = 0.01 + Math.random() * 0.07;
-        
-        // 随机惯性：0.9到0.98之间，值越大惯性越大
-        particleInertias[i] = 0.9 + Math.random() * 0.08;
+        phases[i] = Math.random();
     }
-    
-    // 创建圆形纹理的函数
-    function generateCircleTexture() {
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d');
-        const size = 64;
-        canvas.width = size;
-        canvas.height = size;
-        
-        // 创建径向渐变
-        const gradient = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-        gradient.addColorStop(0, 'rgba(255, 255, 255, 1)');
-        gradient.addColorStop(0.7, 'rgba(255, 255, 255, 0.8)');
-        gradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
-        
-        ctx.fillStyle = gradient;
-        ctx.beginPath();
-        ctx.arc(size/2, size/2, size/2, 0, Math.PI * 2);
-        ctx.fill();
-        
-        // 创建纹理
-        const texture = new THREE.CanvasTexture(canvas);
-        texture.needsUpdate = true;
-        
-        return texture;
-    }
+    geometry.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
     
     // 创建粒子系统
     particleSystem = new THREE.Points(geometry, material);
     
-    // 初始化基础缩放值，与滚轮缩放使用相同的机制
-    particleSystem.userData.baseScale = { x: 1, y: 1, z: 1 };
-    
-    // 保存粒子的基础位置和缩放属性
-    particleSystem.userData.basePositions = basePositions;
-    particleSystem.userData.particleScales = particleScales;
-    particleSystem.userData.particleVelocities = particleVelocities;
-    particleSystem.userData.particleInertias = particleInertias;
-    
-    // 保存原始目标缩放值
-    particleSystem.userData.originalTargetScale = targetScale;
-    
     scene.add(particleSystem);
     particles = geometry.attributes.position.array;
-    
-    // 初始化粒子历史位置
-    particleHistory = [];
-    for (let i = 0; i < particleCount; i++) {
-        particleHistory[i] = [];
-    }
 }
 
 // 根据形状设置粒子位置
@@ -762,10 +744,13 @@ async function initCamera() {
 
 // 模拟手势检测（当摄像头不可用时）
 function simulateHandDetection() {
+    // 已存在定时器则不再重复注册，避免失败重试时叠加多个循环
+    if (simulationIntervalId !== null) return;
+    
     let simulatedDistance = 200;
     let increasing = true;
     
-    setInterval(() => {
+    simulationIntervalId = setInterval(() => {
         if (!isDetecting) return;
         
         // 模拟距离变化
@@ -792,28 +777,62 @@ async function initHandDetection(video) {
     try {
         // 使用MediaPipe Hands进行手势检测
         const model = handPoseDetection.SupportedModels.MediaPipeHands;
-        const detectorConfig = {
-            runtime: 'mediapipe',
-            modelType: 'full',
-            maxHands: 2,
-            solutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915'
-        };
         
-        handDetector = await handPoseDetection.createDetector(model, detectorConfig);
+        // 模型资源依次尝试：本地 vendor/mediapipe（若已放置则可完全离线）→ jsdelivr → unpkg
+        // 单点 CDN 抽风时能自动换源，不会直接掉到"模拟手势"兜底分支
+        const solutionPaths = [
+            'vendor/mediapipe',
+            'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915',
+            'https://unpkg.com/@mediapipe/hands@0.4.1646424915'
+        ];
+        
+        let lastError = null;
+        for (const solutionPath of solutionPaths) {
+            try {
+                handDetector = await handPoseDetection.createDetector(model, {
+                    runtime: 'mediapipe',
+                    modelType: 'full',
+                    maxHands: 2,
+                    solutionPath
+                });
+                console.log('手势模型已加载，来源:', solutionPath);
+                break;
+            } catch (e) {
+                lastError = e;
+                console.warn('手势模型加载失败，尝试下一个源:', solutionPath);
+            }
+        }
+        
+        if (!handDetector) {
+            throw lastError || new Error('所有手势模型源均不可用');
+        }
         
         // 开始检测循环
-        async function detectHands() {
+        // 节流到 ~15fps：MediaPipe 单次推理 20-30ms，若跟着 60fps 渲染每帧都跑，
+        // 会和渲染抢同一个主线程，帧率被拖垮；这里额外用 detectBusy 防止任务堆积
+        const DETECT_INTERVAL = 66;
+        let lastDetectAt = 0;
+        let detectBusy = false;
+        
+        async function detectHands(now) {
             if (!handDetector || !isDetecting) return;
             
+            // 先把下一帧排上，避免异常时检测链断掉
+            requestAnimationFrame(detectHands);
+            
+            const t = typeof now === 'number' ? now : performance.now();
+            if (detectBusy || t - lastDetectAt < DETECT_INTERVAL) return;
+            lastDetectAt = t;
+            
+            detectBusy = true;
             try {
                 const hands = await handDetector.estimateHands(video);
                 handleHandGesture(hands);
             } catch (error) {
                 console.error('手势检测失败:', error);
+            } finally {
+                detectBusy = false;
             }
-            
-            // 继续下一帧检测
-            requestAnimationFrame(detectHands);
         }
         
         // 开始检测
@@ -902,30 +921,19 @@ function animate() {
         particleSystem.rotation.y += 0.008; // 增加旋转速度，更易观察拖尾效果
     }
     
-    // 应用平滑过渡效果，每个粒子独立缩放
+    // 缩放过渡改由 shader 完成：CPU 每帧只动 uniform，不再遍历粒子
     if (particleSystem) {
-        // 获取粒子的基础位置和缩放属性
-        const basePositions = particleSystem.userData.basePositions;
-        const particleScales = particleSystem.userData.particleScales;
-        const particleVelocities = particleSystem.userData.particleVelocities;
-        const particleInertias = particleSystem.userData.particleInertias;
+        const uniforms = particleSystem.material.uniforms;
         
-        // 获取位置属性
-        const positions = particleSystem.geometry.attributes.position.array;
-        
-        // 为每个粒子应用独立的缩放和惯性
-        for (let i = 0; i < particleCount; i++) {
-            // 计算带惯性的平滑缩放过渡
-            particleScales[i] += (targetScale - particleScales[i]) * particleVelocities[i] * (1.0 - particleInertias[i]) * particleSpeed;
-            
-            // 应用缩放后的位置
-            positions[i * 3] = basePositions[i * 3] * particleScales[i];
-            positions[i * 3 + 1] = basePositions[i * 3 + 1] * particleScales[i];
-            positions[i * 3 + 2] = basePositions[i * 3 + 2] * particleScales[i];
+        if (uniforms.uTargetScale.value !== targetScale) {
+            // 目标变化，从当前目标值起算新的过渡
+            uniforms.uFromScale.value = uniforms.uTargetScale.value;
+            uniforms.uTargetScale.value = targetScale;
+            uniforms.uProgress.value = 0;
+        } else if (uniforms.uProgress.value < 1) {
+            // 过渡速度跟随"粒子速度"滑块：默认值 10 对应每帧 0.05，约 20 帧完成
+            uniforms.uProgress.value = Math.min(1, uniforms.uProgress.value + particleSpeed / 200);
         }
-        
-        // 更新粒子位置属性
-        particleSystem.geometry.attributes.position.needsUpdate = true;
         
         // 添加轻微的脉动效果到整个系统
         const time = Date.now() * 0.001;
@@ -966,6 +974,11 @@ function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    
+    // 点大小随高度变化，需同步给 shader
+    if (particleSystem && particleSystem.material.uniforms) {
+        particleSystem.material.uniforms.uPointScale.value = getPointScale();
+    }
 }
 
 // 切换全屏
@@ -1292,7 +1305,8 @@ function initUIEvents() {
         sizeValue.textContent = particleSize.toFixed(2);
         
         if (particleSystem) {
-            particleSystem.material.size = particleSize;
+            // 改为走 shader uniform（ShaderMaterial 没有 size 属性）
+            particleSystem.material.uniforms.uSize.value = particleSize;
         }
     });
     

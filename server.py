@@ -91,7 +91,6 @@ def generate_self_signed_cert():
     """
     import tempfile
     import subprocess
-    import platform
     
     # 创建临时文件存储证书和密钥
     cert_file = tempfile.NamedTemporaryFile(suffix='.pem', delete=False)
@@ -102,28 +101,20 @@ def generate_self_signed_cert():
     key_file.close()
     
     try:
-        if platform.system() == 'Windows':
-            # Windows系统使用PowerShell生成自签名证书
-            powershell_cmd = f"""
-            $cert = New-SelfSignedCertificate -Type SSLServerAuthentication -Subject \"CN=localhost\" -FriendlyName \"3D Particle System\" -KeyAlgorithm RSA -KeyLength 2048 -CertStoreLocation \"Cert:\\CurrentUser\\My\" -NotAfter (Get-Date).AddYears(1)
-            $certPath = \"cert:\\CurrentUser\\My\\$($cert.Thumbprint)\"
-            Export-Certificate -Cert $certPath -FilePath \"{cert_path}\" -Type CERT
-            $keyContainer = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
-            $keyBytes = $keyContainer.Export([System.Security.Cryptography.RSAPrivateKeyFormat]::Pkcs1)
-            [System.IO.File]::WriteAllBytes(\"{key_path}\", $keyBytes)
-            """
-            
-            subprocess.run(['powershell', '-Command', powershell_cmd], check=True, capture_output=True, text=True)
-        else:
-            # Linux/macOS使用openssl生成自签名证书
-            subprocess.run([
-                'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
-                '-keyout', key_path, '-out', cert_path,
-                '-days', '365', '-nodes',
-                '-subj', '/CN=localhost/O=3D Particle System/C=CN'
-            ], check=True, capture_output=True, text=True)
-        
+        # 统一使用 openssl：跨平台可用，输出为 PEM 格式（Python ssl 只认 PEM）
+        # 原 Windows 分支用 PowerShell 的 Export-Certificate 导出的是 DER，
+        # 即使文件名写成 .pem，load_cert_chain 也会报错，因此统一走 openssl
+        subprocess.run([
+            'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+            '-keyout', key_path, '-out', cert_path,
+            '-days', '365', '-nodes',
+            '-subj', '/CN=localhost/O=3D Particle System/C=CN'
+        ], check=True, capture_output=True, text=True)
+
         return cert_path, key_path
+    except FileNotFoundError:
+        logging.warning("未找到 openssl 命令，回退到 HTTP 模式（localhost 属于安全上下文，摄像头仍可用）")
+        return None, None
     except Exception as e:
         logging.error(f"生成自签名证书失败: {e}")
         return None, None
@@ -164,7 +155,9 @@ def run_server(port=DEFAULT_PORT, host=SERVER_HOST, use_https=DEFAULT_USE_HTTPS)
         # 写入musicList.js文件
         music_list_path = Path(current_dir) / "musicList.js"
         try:
-            with open(music_list_path, 'w', encoding='utf-8') as f:
+            # 显式 CRLF：与仓库中其他文件的行尾保持一致，避免每次启动都产生
+            # musicList.js 的全文件 diff（Windows 默认写 CRLF，Linux 默认写 LF）
+            with open(music_list_path, 'w', encoding='utf-8', newline='\r\n') as f:
                 f.write(music_list_content)
             logging.info(f"成功生成musicList.js文件，包含{len(music_files)}首音乐")
         except Exception as e:
@@ -187,19 +180,15 @@ def run_server(port=DEFAULT_PORT, host=SERVER_HOST, use_https=DEFAULT_USE_HTTPS)
             logging.error("HTTPS证书生成失败，将回退到HTTP协议")
             use_https = False
     
+    httpd = None
     try:
         # 创建服务器实例（使用自定义请求处理器）
         with server_class((host, port), CustomRequestHandler) as httpd:
             if use_https:
-                # 包装服务器以支持HTTPS
-                httpd.socket = ssl.wrap_socket(
-                    httpd.socket, 
-                    certfile=cert_path, 
-                    keyfile=key_path, 
-                    server_side=True,
-                    ssl_version=ssl.PROTOCOL_TLS_SERVER,
-                    cert_reqs=ssl.CERT_NONE
-                )
+                # 用 SSLContext 包装：ssl.wrap_socket 在 Python 3.12 已被移除
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(certfile=cert_path, keyfile=key_path)
+                httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
             
             local_ip = get_local_ip()
             protocol = "https" if use_https else "http"
@@ -221,17 +210,23 @@ def run_server(port=DEFAULT_PORT, host=SERVER_HOST, use_https=DEFAULT_USE_HTTPS)
     
     except KeyboardInterrupt:
         logging.info("\n服务器正在停止...")
-        httpd.shutdown()
+        if httpd is not None:
+            httpd.shutdown()
         print("服务器已停止")
     except OSError as e:
-        if e.errno == 48 or "address already in use" in str(e).lower():
-            logging.error(f"错误：80端口已被占用！")
-            logging.error("请关闭占用80端口的程序（如IIS、Apache、Nginx等）")
-        elif e.errno == 13 or "permission denied" in str(e).lower():
-            logging.error(f"错误：无权限使用80端口！")
-            logging.error("Windows：以管理员身份运行终端；Linux/macOS：使用 sudo 执行脚本")
+        # 注意：这里必须用实际 port，不能写死 80（原代码写死导致排查方向完全错）
+        if e.errno in (48, 98, 10048) or "address already in use" in str(e).lower():
+            logging.error(f"错误：端口 {port} 已被占用")
+            logging.error("请关闭占用该端口的程序，或换一个端口启动")
+        elif e.errno in (13, 10013) or "permission denied" in str(e).lower() or "10013" in str(e):
+            logging.error(f"错误：无法绑定端口 {port}（Windows 错误 10013）")
+            logging.error("常见原因有两个：")
+            logging.error("  1) 端口低于 1024，需要管理员权限")
+            logging.error("  2) 该端口落在 Hyper-V/WinNAT 保留段内，普通用户一律拒绝绑定")
+            logging.error("     可用 netsh interface ipv4 show excludedportrange protocol=tcp 查看保留段")
+            logging.error(f"建议换端口，例如：python server.py -p 8765 --no-https")
         else:
-            logging.error(f"服务器启动失败: {e}")
+            logging.error(f"服务器启动失败（端口 {port}）: {e}")
 
 def get_local_ip():
     """获取本地局域网IP（用于验证局域网访问）"""
