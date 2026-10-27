@@ -2,6 +2,30 @@
 
 一个基于Three.js的实时3D粒子交互系统，支持手势控制、音乐可视化和自定义形状。
 
+## ✨ 本仓库改动（相对上游）
+
+本仓库在上游基础上做了两批工程优化，**功能与观感保持不变**，改动集中在性能与可维护性：
+
+### 渲染与性能
+
+- **粒子计算下沉到 shader**：缩放过渡与逐粒子错峰改由 vertex shader 完成。每帧 CPU 只更新 5 个 uniform，不再遍历上万个粒子、也不再每帧上传约 120KB 的位置缓冲
+- **移除纹理依赖**：圆形光斑改用 `gl_PointCoord` 程序化生成，连纹理对象都不再创建
+- **像素比封顶 2x**：高分屏下避免 GPU 填充率成倍上涨
+- **手势检测节流**：MediaPipe 从「每帧推理」改为约 15fps，并加了忙等保护，不再与渲染抢主线程
+
+### 结构
+
+- **消除重复代码**：`index2.html` 原内联了 1400+ 行与 `script.js` 雷同（且已漂移）的脚本，现统一引用外部文件
+- **依赖本地化**：Three.js / TensorFlow.js / HandPoseDetection / MediaPipe / Font Awesome 全部放入 `vendor/`，首屏不再依赖外网 CDN
+- **模型多源回退**：MediaPipe 模型按 `vendor/mediapipe` → jsdelivr → unpkg 顺序尝试，单点 CDN 故障不会直接掉到模拟手势
+
+### 修复
+
+- `alphaTest` 由 `0.5` 调至 `0.01`：原值会把径向渐变的柔和边缘切成硬边圆盘
+- `server.py`：`ssl.wrap_socket` 在 Python 3.12+ 已被移除，改用 `ssl.SSLContext` —— HTTPS 模式在新版本 Python 上恢复可用
+- `server.py`：端口绑定失败时提示真实端口号，并补充 Windows 10013（Hyper-V 保留端口段）的排查指引
+- `server.py`：生成 `musicList.js` 时固定行尾，避免跨平台产生整文件 diff
+
 ## 🎯 功能特性
 
 ![本地截图](images/1.png)
@@ -52,12 +76,18 @@
 
 ```
 ├── README.md             # 项目说明文档
-├── index1.html           # 主页面（版本1）
-├── index2.html           # 主页面（版本2）
-├── script.js             # 3D粒子系统核心逻辑
+├── index1.html           # 主页面（版本1，引用外部 script.js）
+├── index2.html           # 主页（默认入口，同样引用外部 script.js）
+├── script.js             # 3D粒子系统核心逻辑（两份页面共用）
 ├── styles.css            # 样式文件
 ├── musicList.js          # 音乐列表配置（自动生成）
 ├── server.py             # Web服务器（支持HTTPS、并发）
+├── vendor/               # 前端依赖（本地化，无需联网）
+│   ├── three.min.js
+│   ├── tf.min.js
+│   ├── hand-pose-detection.min.js
+│   ├── hands.min.js
+│   └── fontawesome/      # 图标字体（css + webfonts）
 ├── images/               # 项目截图和资源图片
 │   ├── 1.png             # 系统界面截图1
 │   └── 2.png             # 系统界面截图2
@@ -78,31 +108,37 @@
 
 1. **进入项目目录**：
    ```bash
-   cd d:\其他\代码\代码文件\网站
+   cd Gesture-Particle-Interaction-Effects
    ```
 
-2. **运行服务器**：
+2. **运行服务器（推荐方式）**：
    ```bash
-   python server.py
+   python server.py -p 8765 --no-https
    ```
 
-   服务器将自动：
-   - 扫描music文件夹生成musicList.js
-   - 启动HTTPS服务器（默认端口80）
-   - 生成自签名SSL证书（首次运行）
+   推荐先用这个组合，原因见下：
+
+   - **端口**：默认 `80` 需要管理员权限；部分 Windows 机器上 `8000`/`8080` 会落在 Hyper-V 保留段内，绑定直接失败（错误码 10013）。用 `netsh interface ipv4 show excludedportrange protocol=tcp` 可查看保留段
+   - **协议**：`localhost` 本身属于安全上下文，**HTTP 下摄像头同样可用**；只有需要通过局域网 IP 访问时才必须用 HTTPS
+
+   启动后服务器会自动扫描 `music` 文件夹生成 `musicList.js`。
 
 3. **访问系统**：
-   - 本地访问：`https://localhost`
-   - 局域网访问：`https://你的本地IP`
+   - `http://localhost:8765`
+
+   需要 HTTPS 时直接去掉 `--no-https`（首次运行会用 openssl 生成自签名证书）：
+   ```bash
+   python server.py -p 8765
+   ```
 
 ### 命令行参数
 
 ```bash
 # 使用自定义端口
-python server.py -p 8080
+python server.py -p 8765
 
-# 不使用HTTPS（不推荐，摄像头可能无法使用）
-python server.py --no-https
+# 不使用HTTPS（本地 localhost 调试推荐，摄像头仍可用）
+python server.py -p 8765 --no-https
 ```
 
 ## 🎮 使用说明
@@ -209,6 +245,16 @@ let currentShape = 'heart';
 - 添加HTTPS支持
 - 优化服务器端代码
 - 支持映射/内网穿透
+
+### v1.3.0
+- 粒子缩放计算下沉到 vertex shader，移除每帧 O(粒子数) 的 CPU 遍历与位置缓冲上传
+- 圆形光斑改为程序化生成，移除纹理依赖
+- 像素比封顶 2x；手势检测节流至约 15fps
+- 删除 `index2.html` 中重复的内联脚本，两个页面统一引用 `script.js`
+- 前端依赖本地化到 `vendor/`，MediaPipe 模型支持多源回退
+- 修复 `alphaTest` 导致的粒子硬边问题
+- 修复 Python 3.12+ 下 HTTPS 不可用（`ssl.wrap_socket` 已移除）
+- 改进端口绑定失败的错误提示与排查指引
 
 ## 🤝 贡献
 
